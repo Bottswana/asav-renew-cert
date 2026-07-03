@@ -537,10 +537,12 @@ def main(argv=None):
         exit()
 
     # Pull out some existing data from the certificate trustpoint.
-    # We only need to do all of these steps if we can get a common name.
     got_cn = device_class.get_device_common_name()
 
     if got_cn:
+        # If we can't get a common name, this means the trustpoint was never authenticated.
+        # This shouldn't happen normally, but it might if the script fails, and the trustpoint
+        # had to be configured manually.
         device_class.get_trustpoint_usage()
 
         # Reconfigure the trustpoint
@@ -550,7 +552,8 @@ def main(argv=None):
     # Retrieve CSR
     device_csr = device_class.get_device_csr()
     if device_csr is None:
-        # XXX Do we restore usage here?
+        if got_cn:
+            device_class.configure_trustpoint_usage()
         LOGGER.error("Device trustpoint configuration is invalid, no CSR was returned. Fix the device config")
         exit()
 
