@@ -269,15 +269,19 @@ class ASACertInstaller:
             LOGGER.info("Trustpoint not found or no certificate attached, attempting renewal anyway..")
             return True
 
-        # At least in all my tests the ASA returns the actual cert first and then anything else in the chain
-        # So we will pull the first two lines. There is probably a more elegant/reliable way to do this but
+        # The ASA returns the root certificate first followed by the device certifcate.  Likely, if there
+        # is an intermediate certificate, that would be before the device certificate, too.  So, pull things
+        # from the bottom.
+        # There is probably a more elegant/reliable way to do this but
         # the on device filtering is limited on the ASA
         # Date format: 09:27:28 UTC Dec 2 2025
         # Python     : %H:%M:%S %Z  %b  %d %Y
         date_data = {}
         split_data = output_data.split('\n')
-        cert_end_date = datetime.datetime.strptime((split_data[1].split('date:')[1]).strip(), "%H:%M:%S %Z %b %d %Y")
-        cert_start_date = datetime.datetime.strptime((split_data[0].split('date:')[1]).strip(), "%H:%M:%S %Z %b %d %Y")
+        cert_edate = split_data[-1]
+        cert_sdate = split_data[-2]
+        cert_end_date = datetime.datetime.strptime((cert_edate.split('date:')[1]).strip(), "%H:%M:%S %Z %b %d %Y")
+        cert_start_date = datetime.datetime.strptime((cert_sdate.split('date:')[1]).strip(), "%H:%M:%S %Z %b %d %Y")
         LOGGER.debug("Retrieved trustpoint %s validity; Start: %s, End: %s", self.device_trustpoint, cert_start_date, cert_end_date)
 
         # Check expiry date
