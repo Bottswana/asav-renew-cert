@@ -254,7 +254,7 @@ class LetsEncrypt:
 ############# ASA Certificate Installation
 
 class ASACertInstaller:
-    def __init__(self, device_hostname, device_username, device_password, device_trustpoint):
+    def __init__(self, device_hostname, device_username, device_password, device_trustpoint, root_domain, saml_idp=None, alt_fqdn=None):
         self.device_trustpoint = device_trustpoint
         self.connect_handler = ConnectHandler(**{
             "device_type": "cisco_asa",
@@ -262,6 +262,13 @@ class ASACertInstaller:
             "username": device_username,
             "password": device_password
         })
+        self.root_domain = root_domain
+        self.saml_idp = saml_idp
+        self.alt_fqdn = alt_fqdn
+
+        # These are set later.
+        self.trustpoint_interfaces = []
+        self.device_fqdn = None
 
     def check_renewal_needed(self):
         output_data = self.connect_handler.send_command(f"show crypto ca certificates {self.device_trustpoint} | include date:")
@@ -294,6 +301,94 @@ class ASACertInstaller:
             return False
         return True
 
+    def get_device_common_name(self):
+        output_data = self.connect_handler.send_command(f"show crypto ca certificates {self.device_trustpoint} | include CN=")
+        if output_data == "":
+            LOGGER.error("Failed to find device CN in certificate chain!  Check the device config.")
+            return False
+
+        split_data = output_data.split('\n')
+        # The CN _should_ be the last one in the list.  But we'll check the domain name to make sure we get one.
+        for cn in split_data[::-1]:
+            _, fqdn = cn.split('=', 1)
+            if self.root_domain.lower() in fqdn.lower():
+                self.device_fqdn = fqdn
+                return True
+
+        LOGGER.error("Failed to find a valid device common name in %s", output_data)
+        return False
+
+    def get_trustpoint_usage(self):
+        output_data = self.connect_handler.send_command(f"show running | inc ssl trust-point {self.device_trustpoint}")
+        if output_data == "":
+            LOGGER.info("Didn't find any usage for trustpoint.")
+            return
+
+        split_data = output_data.split('\n')
+        interfaces = []
+        for line in split_data:
+            command = line.split(None)
+            interfaces.append(command[-1])
+
+        self.trustpoint_interfaces = interfaces
+
+    def remove_trustpoint(self):
+        full_command_set = []
+        for intf in self.trustpoint_interfaces:
+            full_command_set.append(f"no ssl trust-point {self.device_trustpoint} {intf}")
+
+        if self.saml_idp:
+            full_command_set += ["webvpn", f"saml idp {self.saml_idp}", f"no trustpoint sp {self.device_trustpoint}"]
+
+        full_command_set.append(f"no crypto ca trustpoint {self.device_trustpoint} noconfirm")
+
+        LOGGER.debug("Executing command set:\n%s", '\n'.join(full_command_set))
+        output = self.connect_handler.send_config_set(full_command_set)
+        LOGGER.debug("Output from trustpoint removal:\n%s", output)
+        if "is currently in use and cannot be removed" in output:
+            raise RuntimeError("Failed to remove trustpoint!  Check your SAML IDP value.")
+
+    def configure_trustpoint(self):
+        full_command_set = [
+                f"crypto ca trustpoint {self.device_trustpoint}",
+                "enrollment terminal",
+                f"fqdn {self.device_fqdn}",
+        ]
+
+        if self.alt_fqdn:
+            full_command_set.append(f"alt-fqdn {self.alt_fqdn}")
+
+        full_command_set += [
+                f"subject-name CN={self.device_fqdn}",
+                f"keypair {self.device_trustpoint}",
+                "no validation-usage",
+                "crl configure",
+        ]
+
+        LOGGER.debug("Executing command set:\n%s", '\n'.join(full_command_set))
+        output = self.connect_handler.send_config_set(full_command_set)
+        output += self.connect_handler.save_config()
+        LOGGER.debug("Output from trustpoint removal:\n%s", output)
+
+    def configure_trustpoint_usage(self):
+        full_command_set = []
+
+        for intf in self.trustpoint_interfaces:
+            full_command_set.append(f"ssl trust-point {self.device_trustpoint} {intf}")
+
+        if self.saml_idp:
+            full_command_set += ["webvpn", f"saml idp {self.saml_idp}", f"trustpoint sp {self.device_trustpoint}"]
+
+        if not full_command_set:
+            LOGGER.info("No trustpoint usage to configure.")
+            return
+
+        LOGGER.debug("Executing command set:\n%s", '\n'.join(full_command_set))
+        output = self.connect_handler.send_config_set(full_command_set)
+        output += self.connect_handler.save_config()
+        LOGGER.debug("Output from trustpoint removal:\n%s", output)
+
+
     def install_certificate(self, cert, csr):
         # Load the CSR
         certificate_request = x509.load_pem_x509_csr(csr.encode('ASCII'))
@@ -317,11 +412,11 @@ class ASACertInstaller:
         # "nointeractive" on ASA means we keep config prompt which makes netmiko happy, though technically its an ASDM only option
         # Note we also remove the trustpoint, as the ASA is to dumb to allow you to replace the trustpoint with a new one without
         # removing everything first. (*grumpy noises*)
-        full_command_set = [f"crypto ca import {self.device_trustpoint} certificate nointeractive"]
-        full_command_set += issued_certificate.split('\n')
-        full_command_set.append("quit")
-        full_command_set.append(f"crypto ca authenticate {self.device_trustpoint} nointeractive")
+        full_command_set = [f"crypto ca authenticate {self.device_trustpoint} nointeractive"]
         full_command_set += cert_chain[0].split('\n')
+        full_command_set.append("quit")
+        full_command_set.append(f"crypto ca import {self.device_trustpoint} certificate nointeractive")
+        full_command_set += issued_certificate.split('\n')
         full_command_set.append("quit")
 
         # Issue commands to device
@@ -385,6 +480,8 @@ def main(argv=None):
     parser.add_argument("--device-username", required=True, help="Username to connect to the device with")
     parser.add_argument("--device-password", required=True, help="Password to connect to the device with")
     parser.add_argument("--device-trustpoint", required=True, help="The name of the trustpoint to update with the new certificate")
+    parser.add_argument("--device-saml-idp", help="The name of the SAML IDP if used")
+    parser.add_argument("--device-alt-fqdn", help="The alternate FQDN for the device if used")
     args = parser.parse_args(argv)
     pprint.pprint(args)
 
@@ -420,20 +517,36 @@ def main(argv=None):
         exit()
 
     # Create the connection to the device
-    device_class = ASACertInstaller(device_hostname=args.device_hostname, device_username=args.device_username, device_password=args.device_password, device_trustpoint=args.device_trustpoint)
+    device_class = ASACertInstaller(device_hostname=args.device_hostname, device_username=args.device_username, device_password=args.device_password, device_trustpoint=args.device_trustpoint, root_domain=args.porkbun_domain, saml_idp=args.device_saml_idp, alt_fqdn=args.device_alt_fqdn)
     if not device_class.check_renewal_needed():
         LOGGER.info("The trustpoint on the device %s is not yet due for renewal", args.device_hostname)
         exit()
 
+    # Pull out some existing data from the certificate trustpoint.
+    # We only need to do all of these steps if we can get a common name.
+    got_cn = device_class.get_device_common_name()
+
+    if got_cn:
+        device_class.get_trustpoint_usage()
+
+        # Reconfigure the trustpoint
+        device_class.remove_trustpoint()
+        device_class.configure_trustpoint()
+
     # Retrieve CSR
     device_csr = device_class.get_device_csr()
     if device_csr is None:
+        # XXX Do we restore usage here?
         LOGGER.error("Device trustpoint configuration is invalid, no CSR was returned. Fix the device config")
         exit()
 
     # Renew certificate
     cert, private_key = acme_class.request_certificate(args.device_hostname, certificate_request=device_csr)
     device_class.install_certificate(cert, device_csr)
+
+    if got_cn:
+        # Cert is renewed, let's restore the trustpoint usage
+        device_class.configure_trustpoint_usage()
 
 if __name__ == "__main__":
     main(sys.argv[1:])
