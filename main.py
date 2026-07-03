@@ -254,7 +254,7 @@ class LetsEncrypt:
 ############# ASA Certificate Installation
 
 class ASACertInstaller:
-    def __init__(self, device_hostname, device_username, device_password, device_trustpoint, root_domain, saml_idp=None, alt_fqdn=None):
+    def __init__(self, device_hostname, device_username, device_password, device_trustpoint, root_domain, alt_fqdn=None):
         self.device_trustpoint = device_trustpoint
         self.connect_handler = ConnectHandler(**{
             "device_type": "cisco_asa",
@@ -263,12 +263,12 @@ class ASACertInstaller:
             "password": device_password
         })
         self.root_domain = root_domain
-        self.saml_idp = saml_idp
         self.alt_fqdn = alt_fqdn
 
         # These are set later.
         self.trustpoint_interfaces = []
         self.device_fqdn = None
+        self.saml_idp = None
 
     def check_renewal_needed(self):
         output_data = self.connect_handler.send_command(f"show crypto ca certificates {self.device_trustpoint} | include date:")
@@ -331,6 +331,21 @@ class ASACertInstaller:
             interfaces.append(command[-1])
 
         self.trustpoint_interfaces = interfaces
+
+        # Check for IDP
+        output_data = self.connect_handler.send_command(f"show webvpn saml idp")
+        if output_data != "":
+            split_data = output_data.split('\n')
+            cur_idp = None
+            for line in split_data:
+                if line.startswith("saml idp"):
+                    parts = line.split(None)
+                    cur_idp = parts[-1]
+                    continue
+                if self.device_trustpoint in line:
+                    LOGGER.debug(f"Found SAML IDP {cur_idp}")
+                    self.saml_idp = cur_idp
+                    break
 
     def remove_trustpoint(self):
         full_command_set = []
@@ -480,7 +495,6 @@ def main(argv=None):
     parser.add_argument("--device-username", required=True, help="Username to connect to the device with")
     parser.add_argument("--device-password", required=True, help="Password to connect to the device with")
     parser.add_argument("--device-trustpoint", required=True, help="The name of the trustpoint to update with the new certificate")
-    parser.add_argument("--device-saml-idp", help="The name of the SAML IDP if used")
     parser.add_argument("--device-alt-fqdn", help="The alternate FQDN for the device if used")
     args = parser.parse_args(argv)
     pprint.pprint(args)
@@ -517,7 +531,7 @@ def main(argv=None):
         exit()
 
     # Create the connection to the device
-    device_class = ASACertInstaller(device_hostname=args.device_hostname, device_username=args.device_username, device_password=args.device_password, device_trustpoint=args.device_trustpoint, root_domain=args.porkbun_domain, saml_idp=args.device_saml_idp, alt_fqdn=args.device_alt_fqdn)
+    device_class = ASACertInstaller(device_hostname=args.device_hostname, device_username=args.device_username, device_password=args.device_password, device_trustpoint=args.device_trustpoint, root_domain=args.porkbun_domain, alt_fqdn=args.device_alt_fqdn)
     if not device_class.check_renewal_needed():
         LOGGER.info("The trustpoint on the device %s is not yet due for renewal", args.device_hostname)
         exit()
