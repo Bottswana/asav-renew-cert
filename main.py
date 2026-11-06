@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, base64, random, string, josepy, pickle, argparse, logging, sys, textwrap, pprint, json, time, datetime, porkbun_api
+import os, base64, random, string, josepy, pickle, argparse, logging, sys, textwrap, pprint, json, time, datetime, porkbun_api, re
 from acme import client, messages, challenges, errors
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -78,8 +78,8 @@ class LetsEncrypt:
             LOGGER.debug("Registering with directory using email address '%s'", email_address)
             client_registration_response = client_acme.new_account(messages.NewRegistration.from_data(email=email_address, terms_of_service_agreed=True))
             client_formatted_private_key = new_private_key.private_bytes(
-                encoding=serialization.Encoding.PEM, 
-                format=serialization.PrivateFormat.PKCS8,  
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
                 encryption_algorithm=serialization.NoEncryption()
             )
 
@@ -93,7 +93,7 @@ class LetsEncrypt:
             return None
 
         # Format the account data
-        pkey_data = { 
+        pkey_data = {
             "private_key": client_formatted_private_key.decode(),
             "account_data": client_registration_response.to_json(),
             "directory": self.acme_directory_uri
@@ -147,8 +147,8 @@ class LetsEncrypt:
             LOGGER.debug("Creating Private Key with modulus %d", key_size)
             certificate_pkey = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
             certificate_pkey_formatted = certificate_pkey.private_bytes(
-                encoding=serialization.Encoding.PEM, 
-                format=serialization.PrivateFormat.PKCS8,  
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
                 encryption_algorithm=serialization.NoEncryption()
             ).decode()
             LOGGER.debug("Created private key:\n%s", certificate_pkey_formatted)
@@ -184,6 +184,7 @@ class LetsEncrypt:
             for challenge in requests.body.challenges:
                 if not isinstance(challenge.chall, challenges.DNS01):
                     continue
+
 
                 # Obtain the challenge
                 response, validation = challenge.response_and_validation(client_acme.net.key)
@@ -263,12 +264,13 @@ class ASACertInstaller:
             "password": device_password
         })
         self.root_domain = root_domain
+        self.saml_idp = None
         self.alt_fqdn = alt_fqdn
+
 
         # These are set later.
         self.trustpoint_interfaces = []
         self.device_fqdn = None
-        self.saml_idp = None
 
     def check_renewal_needed(self):
         output_data = self.connect_handler.send_command(f"show crypto ca certificates {self.device_trustpoint} | include date:")
@@ -332,20 +334,25 @@ class ASACertInstaller:
 
         self.trustpoint_interfaces = interfaces
 
-        # Check for IDP
-        output_data = self.connect_handler.send_command(f"show webvpn saml idp")
-        if output_data != "":
-            split_data = output_data.split('\n')
-            cur_idp = None
-            for line in split_data:
-                if line.startswith("saml idp"):
-                    parts = line.split(None)
-                    cur_idp = parts[-1]
-                    continue
-                if self.device_trustpoint in line:
-                    LOGGER.debug(f"Found SAML IDP {cur_idp}")
-                    self.saml_idp = cur_idp
-                    break
+    def get_saml_idp(self):
+        output_data = self.connect_handler.send_command("show running | begin ^ saml idp")
+        if output_data == "":
+            LOGGER.info("Didn't find any configured SAML IDPs.")
+            return
+
+        split_data = output_data.split('\n')
+        saml_idp = None
+        for line in split_data:
+            if m := re.search(r"^ saml idp (.+)", line):
+                saml_idp = m.group(1)
+                continue
+            if re.search(r"^ \S", line) or re.search(r"^\S", line):
+                saml_idp = None
+                continue
+            if re.search(rf"^  trustpoint sp {self.device_trustpoint}", line):
+                break
+
+        self.saml_idp = saml_idp
 
     def remove_trustpoint(self):
         full_command_set = []
@@ -355,13 +362,12 @@ class ASACertInstaller:
         if self.saml_idp:
             full_command_set += ["webvpn", f"saml idp {self.saml_idp}", f"no trustpoint sp {self.device_trustpoint}"]
 
+
         full_command_set.append(f"no crypto ca trustpoint {self.device_trustpoint} noconfirm")
 
         LOGGER.debug("Executing command set:\n%s", '\n'.join(full_command_set))
         output = self.connect_handler.send_config_set(full_command_set)
         LOGGER.debug("Output from trustpoint removal:\n%s", output)
-        if "is currently in use and cannot be removed" in output:
-            raise RuntimeError("Failed to remove trustpoint!  Check your SAML IDP value.")
 
     def configure_trustpoint(self):
         full_command_set = [
@@ -537,13 +543,12 @@ def main(argv=None):
         exit()
 
     # Pull out some existing data from the certificate trustpoint.
+    # We only need to do all of these steps if we can get a common name.
     got_cn = device_class.get_device_common_name()
 
     if got_cn:
-        # If we can't get a common name, this means the trustpoint was never authenticated.
-        # This shouldn't happen normally, but it might if the script fails, and the trustpoint
-        # had to be configured manually.
         device_class.get_trustpoint_usage()
+        device_class.get_saml_idp()
 
         # Reconfigure the trustpoint
         device_class.remove_trustpoint()
@@ -552,8 +557,7 @@ def main(argv=None):
     # Retrieve CSR
     device_csr = device_class.get_device_csr()
     if device_csr is None:
-        if got_cn:
-            device_class.configure_trustpoint_usage()
+        # XXX Do we restore usage here?
         LOGGER.error("Device trustpoint configuration is invalid, no CSR was returned. Fix the device config")
         exit()
 
